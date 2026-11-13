@@ -416,6 +416,7 @@ if(WITH_SSCP_COMPILER)
         metal/HLExtractionPass.cpp
         metal/PointerTranslationAnnotationPass.cpp
         metal/PointerTranslationPass.cpp
+        metal/MixedAddressSpaceSelectPass.cpp
         metal/IntegerLegalizationPass.cpp
         metal/HLTree.cpp
         metal/Emitter.cpp

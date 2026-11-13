@@ -1610,6 +1610,13 @@ unsigned MetalEmitter::getPhysicalPointerAddressSpace(const Value* V) {
     if (trueAS != 0 && trueAS == falseAS) {
       return (inferredPtrAS[V] = trueAS);
     }
+    // select with a null operand: null is valid in any address space
+    if (trueAS != 0 && isa<ConstantPointerNull>(Select->getFalseValue())) {
+      return (inferredPtrAS[V] = trueAS);
+    }
+    if (falseAS != 0 && isa<ConstantPointerNull>(Select->getTrueValue())) {
+      return (inferredPtrAS[V] = falseAS);
+    }
   }
   if (auto* LI = dyn_cast<LoadInst>(V)) {
     const Value* addr = LI->getPointerOperand();       // address of the slot

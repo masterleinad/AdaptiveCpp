@@ -11,6 +11,7 @@
 #include "hipSYCL/compiler/llvm-to-backend/metal/LLVMToMetal.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationAnnotationPass.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/metal/PointerTranslationPass.hpp"
+#include "hipSYCL/compiler/llvm-to-backend/metal/MixedAddressSpaceSelectPass.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/metal/IntegerLegalizationPass.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/AddressSpaceInferencePass.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/AddressSpaceMap.hpp"
@@ -634,6 +635,8 @@ bool LLVMToMetalTranslator::translateToBackendFormat(llvm::Module& FlavoredModul
     llvm::FunctionPassManager FPM;
     FPM.addPass(llvm::PromotePass());
     FPM.addPass(ExpandIntrinsics());
+    // Must run before StructurizeCFG: it duplicates code regions.
+    FPM.addPass(MixedAddressSpaceSelectPass());
     FPM.addPass(llvm::LowerSwitchPass());
     FPM.addPass(llvm::LoopSimplifyPass());
     FPM.addPass(llvm::LCSSAPass());
