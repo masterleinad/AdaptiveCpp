@@ -1,0 +1,156 @@
+name: Build macOS DMG (AdaptiveCpp + LLVM, Metal)
+
+# Builds a self-contained AdaptiveCpp/LLVM toolchain with the Metal backend and
+# packages it as a DMG. The DMG is attached to a GitHub release so that
+# workflows in other repositories can download it (see "Consuming" below).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to upload the DMG to (created if missing). Empty = artifact only."
+        required: false
+        default: ""
+  push:
+    tags: [ 'dmg-*' ]
+
+env:
+  LLVM_REF: llvmorg-21.1.8      # keep in sync with the LLVM version you develop against
+
+jobs:
+  build_dmg:
+    runs-on: macos-26           # macOS 26 SDK is needed by metal-cpp
+    timeout-minutes: 360
+    permissions:
+      contents: write           # needed to create/update the release
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+        path: AdaptiveCpp
+
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2.21
+      with:
+        key: dmg-${{ env.LLVM_REF }}
+        max-size: 2G
+
+    - name: clone LLVM
+      run: |
+        git clone --depth 1 --single-branch -b ${LLVM_REF} \
+          https://github.com/llvm/llvm-project llvm
+
+    - name: install dependencies
+      run: brew install cmake ninja boost
+
+    - name: build (2-stage, AdaptiveCpp linked into clang)
+      run: |
+        mkdir build && cd build
+        cmake ../llvm/llvm -GNinja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=${GITHUB_WORKSPACE}/install \
+          -DCMAKE_OSX_SYSROOT="$(xcrun --show-sdk-path)" \
+          -DLLVM_TARGETS_TO_BUILD="AArch64" \
+          -DLLVM_ENABLE_PROJECTS="clang;lld" \
+          -DLLVM_ENABLE_RUNTIMES="compiler-rt" \
+          -DLLVM_PARALLEL_LINK_JOBS=2 \
+          -DLLVM_BUILD_LLVM_DYLIB=ON \
+          -DLLVM_LINK_LLVM_DYLIB=ON \
+          -DLLVM_CCACHE_BUILD=ON \
+          -DCLANG_ENABLE_BOOTSTRAP=ON \
+          -DCLANG_BOOTSTRAP_PASSTHROUGH="CMAKE_INSTALL_PREFIX;LLVM_TARGETS_TO_BUILD;LLVM_PARALLEL_LINK_JOBS;LLVM_BUILD_LLVM_DYLIB;LLVM_LINK_LLVM_DYLIB;LLVM_CCACHE_BUILD;CMAKE_OSX_SYSROOT" \
+          -DBOOTSTRAP_LLVM_ENABLE_PROJECTS="clang;lld;openmp" \
+          -DBOOTSTRAP_LLVM_EXTERNAL_PROJECTS=AdaptiveCpp \
+          -DBOOTSTRAP_LLVM_EXTERNAL_ADAPTIVECPP_SOURCE_DIR=${GITHUB_WORKSPACE}/AdaptiveCpp \
+          -DBOOTSTRAP_LLVM_ADAPTIVECPP_LINK_INTO_TOOLS=ON \
+          -DBOOTSTRAP_WITH_OPENCL_BACKEND=OFF \
+          -DBOOTSTRAP_WITH_METAL_BACKEND=ON
+        ninja stage2-install
+
+    - name: patch clang float.h (INFINITY/NAN with Apple SDK headers)
+      run: |
+        F=$(ls ${GITHUB_WORKSPACE}/install/lib/clang/*/include/float.h)
+        cat >> "$F" <<'PATCH'
+        #if defined(__need_infinity_nan)
+        #  ifndef INFINITY
+        #    define INFINITY (__builtin_inff())
+        #  endif
+        #  ifndef NAN
+        #    define NAN (__builtin_nanf(""))
+        #  endif
+        #  undef __need_infinity_nan
+        #endif
+        PATCH
+
+    - name: smoke test the install
+      run: |
+        export PATH=${GITHUB_WORKSPACE}/install/bin:$PATH
+        cat > smoke.cpp <<'CPP'
+        #include <sycl/sycl.hpp>
+        #include <cmath>
+        #include <iostream>
+        int main() {
+          sycl::queue q;
+          int *p = sycl::malloc_shared<int>(1, q);
+          *p = 0;
+          q.single_task([=] { *p = 42; }).wait();
+          std::cout << *p << " " << INFINITY << "\n";
+          return *p == 42 ? 0 : 1;
+        }
+        CPP
+        acpp -O2 smoke.cpp -o smoke
+        ./smoke
+
+    - name: create DMG
+      run: |
+        STAGE=dmg/AdaptiveCpp-Metal
+        mkdir -p $STAGE
+        cp -R install $STAGE/acpp
+        cp AdaptiveCpp/packaging/macos/install.sh $STAGE/
+        echo -n "${GITHUB_WORKSPACE}/install" > $STAGE/build-prefix.txt
+        cat > $STAGE/README.txt <<'TXT'
+        AdaptiveCpp + LLVM with Metal backend (Apple Silicon).
+        Install: ./install.sh [prefix]   (default /opt/acpp)
+        Then:    export PATH=<prefix>/bin:$PATH; acpp --acpp-targets=generic foo.cpp
+        TXT
+        hdiutil create -volname "AdaptiveCpp-Metal" -srcfolder dmg/AdaptiveCpp-Metal \
+          -ov -format UDZO AdaptiveCpp-Metal-arm64.dmg
+        shasum -a 256 AdaptiveCpp-Metal-arm64.dmg > AdaptiveCpp-Metal-arm64.dmg.sha256
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: AdaptiveCpp-Metal-arm64-dmg
+        path: |
+          AdaptiveCpp-Metal-arm64.dmg
+          AdaptiveCpp-Metal-arm64.dmg.sha256
+
+    - name: publish to release
+      if: github.event_name == 'push' || inputs.release_tag != ''
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ inputs.release_tag || github.ref_name }}
+      run: |
+        cd AdaptiveCpp
+        gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "Prebuilt AdaptiveCpp/LLVM (Metal) DMG"
+        gh release upload "$TAG" ../AdaptiveCpp-Metal-arm64.dmg ../AdaptiveCpp-Metal-arm64.dmg.sha256 --clobber
+
+# ---------------------------------------------------------------------------
+# Consuming the DMG from a workflow in a different repository
+# (replace OWNER/REPO with the repository that built the DMG; if it is private
+#  the consumer needs a token with contents:read on it, passed as GH_TOKEN):
+#
+#   jobs:
+#     test:
+#       runs-on: macos-26
+#       steps:
+#       - name: install AdaptiveCpp
+#         env:
+#           GH_TOKEN: ${{ github.token }}   # or a PAT for private repos
+#         run: |
+#           gh release download dmg-latest -R OWNER/REPO -p 'AdaptiveCpp-Metal-arm64.dmg*'
+#           shasum -a 256 -c AdaptiveCpp-Metal-arm64.dmg.sha256
+#           hdiutil attach AdaptiveCpp-Metal-arm64.dmg -nobrowse -mountpoint /Volumes/acpp
+#           /Volumes/acpp/install.sh $HOME/acpp
+#           hdiutil detach /Volumes/acpp
+#           echo "$HOME/acpp/bin" >> $GITHUB_PATH
+# ---------------------------------------------------------------------------
