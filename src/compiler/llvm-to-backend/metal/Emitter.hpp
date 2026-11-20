@@ -94,6 +94,7 @@ private:
 
   // types and per-module info
   std::unordered_map<unsigned, std::string> addressSpaceMap;
+  bool useCoherentDeviceMemory = false;
   std::unordered_map<const llvm::Type*, std::string> typeCache;
   std::unordered_map<const llvm::Type*, std::string> anonStructs;
   int nextAnonymousStructId = 0;

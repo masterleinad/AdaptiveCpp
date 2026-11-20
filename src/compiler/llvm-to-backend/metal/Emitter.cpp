@@ -144,6 +144,27 @@ MetalEmitter::MetalEmitter(Module& M, const std::unordered_set<std::string>& ker
   : M(M), kernelNames(kernelNames), opt(opt)
   , addressSpaceMap{opt.addressSpaceMap}
 {
+  // Apple GPUs do not make plain device-memory stores visible to other
+  // threadgroups through atomic_thread_fence alone. If the module relies on a
+  // device-scope fence (acquire/release atomics, e.g. the "last workgroup
+  // combines the partial results" pattern), access device memory through
+  // `device coherent(device)` pointers so that the fence actually publishes
+  // the data.
+  for (const GlobalVariable& GV : M.globals()) {
+    if (!GV.hasInitializer())
+      continue;
+    auto* CDA = dyn_cast<ConstantDataArray>(GV.getInitializer());
+    if (!CDA || !CDA->isString())
+      continue;
+    if (CDA->getAsString().contains("thread_scope_device")) {
+      useCoherentDeviceMemory = true;
+      break;
+    }
+  }
+  if (useCoherentDeviceMemory) {
+    addressSpaceMap[0] = "device coherent(device)";
+    addressSpaceMap[1] = "device coherent(device)";
+  }
 }
 
 bool MetalEmitter::emit(std::string& out) {
@@ -161,13 +182,13 @@ bool MetalEmitter::emit(std::string& out) {
 
   analyzeCallInsts();
 
-  os << R"__(
+  std::string preludeText = R"__(
 #include <metal_stdlib>
 using namespace metal;
 
 // These structs are used for void** dereferencing
 struct __struct_ptr_to_device {
-  device void* value;
+  @DEV@ void* value;
 };
 
 struct __struct_ptr_to_threadgroup {
@@ -186,7 +207,7 @@ template<typename To, typename From>
 struct __atomic_pointer_type {};
 
 template<typename To>
-struct __atomic_pointer_type<To, device void*> {
+struct __atomic_pointer_type<To, @DEV@ void*> {
   using type = device atomic<To>*;
 };
 
@@ -209,8 +230,8 @@ template<typename To, typename From>
 struct __pointer_type {};
 
 template<typename To>
-struct __pointer_type<To, device void*> {
-  using type = device To*;
+struct __pointer_type<To, @DEV@ void*> {
+  using type = @DEV@ To*;
 };
 
 template<typename To>
@@ -243,6 +264,11 @@ constant long& constant __acpp_sscp_metal_gpu_to_host_addr_diff [[buffer(1)]];
 device uint* constant __acpp_sscp_metal_atomic64_lock_base [[buffer(2)]];
 
 )__";
+  for (size_t pos = 0; (pos = preludeText.find("@DEV@", pos)) != std::string::npos; ) {
+    preludeText.replace(pos, 5, addressSpaceMap[1]);
+    pos += addressSpaceMap[1].size();
+  }
+  os << preludeText;
 
   emitTypes();
   emitIntrinsicHelpers();
@@ -714,7 +740,7 @@ bool MetalEmitter::emitInstruction(const Instruction& I, int level) {
       // ** type, need to use struct slot hack to dereference pointer to pointer
       auto elemPhysAS = getPhysicalPointerAddressSpace(LI);
       auto elemAddrSpace = getAddressSpaceKeyword(elemPhysAS);
-      auto structName = "__struct_ptr_to_" + elemAddrSpace;
+      auto structName = "__struct_ptr_to_" + elemAddrSpace.substr(0, elemAddrSpace.find(' '));
       os << indent(level) << name << " = ((" << addrSpace << " " << structName << "*)" << ptr << ")->value; " << "// " << instToString(I) << "\n";
     } else {
       os << indent(level) << name << " = *((" << addrSpace << " " << elemType << "*)" << ptr << "); " << "// " << instToString(I) << "\n";
@@ -733,7 +759,7 @@ bool MetalEmitter::emitInstruction(const Instruction& I, int level) {
       // ** type, need to use struct slot hack to dereference pointer to pointer
       auto elemPhysAS = getPhysicalPointerAddressSpace(SI->getValueOperand());
       auto elemAddrSpace = getAddressSpaceKeyword(elemPhysAS);
-      auto structName = "__struct_ptr_to_" + elemAddrSpace;
+      auto structName = "__struct_ptr_to_" + elemAddrSpace.substr(0, elemAddrSpace.find(' '));
       os << indent(level) << "((" << addrSpace << " " << structName << "*)" << ptr << ")->value = " << val << "; " << "// " << instToString(I) << "\n";
     } else {
       os << indent(level) << "*((" << addrSpace << " " << elemType << "*)" << ptr << ") = " << val << "; " << "// " << instToString(I) << "\n";
@@ -1222,7 +1248,7 @@ void MetalEmitter::emitGEPInstruction(const GetElementPtrInst* GEP, const std::s
   if (srcElemType->isPointerTy()) {
     auto pointerAS = srcElemType->getPointerAddressSpace();
     auto elemAddrSpace = getAddressSpaceKeyword(pointerAS);
-    auto structName = "__struct_ptr_to_" + elemAddrSpace;
+    auto structName = "__struct_ptr_to_" + elemAddrSpace.substr(0, elemAddrSpace.find(' '));
     typeName = structName;
   }
 
